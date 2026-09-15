@@ -9,6 +9,7 @@
 // 1. KHAI BÁO CHÂN (PINS DEFINITION)
 // ==========================================
 #define DHTPIN 4            
+#define BUZZER 45
 
 #define PIR_PIN 14               
 #define LED_PIN 15      
@@ -187,8 +188,10 @@ void setup() {
   ledcAttachPin(INA, PWM_A);
   ledcAttachPin(INB, PWM_B);
   
-  // Cấu hình chân Đèn LED
+  // Cấu hình chân Đèn LED, Buzzer
   pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER,OUTPUT);
+  digitalWrite(BUZZER,LOW); // Tắt buzzer lúc mới khởi động
   digitalWrite(LED_PIN, LOW); // Tắt đèn lúc mới khởi động
   
     initESPNow();
@@ -208,10 +211,12 @@ void loop() {
     if(t > TEMP_THRESHOLD)
     {
       fanOn();
+      digitalWrite(BUZZER, HIGH);
     }
     else
     {
       fanOff();
+      digitalWrite(BUZZER, LOW);
     }
 
     if(lux < LUX_THRESHOLD)
