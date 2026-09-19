@@ -5,62 +5,60 @@
 #include <BH1750.h>
 #include "DHT.h"
 
-// ==========================================
-// 1. KHAI BÁO CHÂN (PINS DEFINITION)
-// ==========================================
-#define DHTPIN 4            
+#define DHTPIN 4
 #define BUZZER 45
 
-#define PIR_PIN 14               
-#define LED_PIN 15      
+#define PIR_PIN 14
+#define LED_PIN 15
 
-#define I2C_SDA 16        
-#define I2C_SCL 17        
+#define I2C_SDA 16
+#define I2C_SCL 17
 
 #define INA 18
 #define INB 19
 
 #define PWM_A 0
 #define PWM_B 1
+#define PWM_BUZZER 2
 #define PWM_FREQ 5000
+#define BUZZER_PWM_FREQ 2000
 #define PWM_RES 8
 #define FAN_SPEED 200
+#define BUZZER_MED_DUTY 128
+#define BUZZER_MAX_DUTY 255
+
+#define SENSOR_INTERVAL_MS 2000UL
+#define FAN_OFF_DELAY_MS 60000UL
 
 DHT dht;
 BH1750 lightMeter;
 
+uint8_t gatewayMAC[] = {0x1C, 0xDB, 0xD4, 0xCB, 0xCE, 0xE8};
 
-uint8_t gatewayMAC[] ={ 0x1C,0xDB,0xD4,0xCB,0xCE,0xE8};
-
-typedef struct {
+typedef struct __attribute__((packed)) {
   float temp;
   float humid;
-  float lux;
+  float light;
+  bool motion;
+  bool fan;
+  bool led;
+  uint8_t alarm_level;
 } SensorData;
 
-typedef struct {
-  char command[10];
+typedef struct __attribute__((packed)) {
+  char command[20];
 } ControlData;
 
 SensorData sensorData;
 
-// ==========================================
-// 2. CÁC BIẾN QUẢN LÝ TRẠNG THÁI & THỜI GIAN
-// ==========================================
-unsigned long previousMillis = 0;
-const long interval = 2000; // Đọc cảm biến mỗi 2 giây (2000ms)
+const float LUX_THRESHOLD = 50.0;
 
-bool isAutoMode = true;     // Mặc định khởi động là chế độ Tự động
-int manualFanSpeed = 0;     // Tốc độ quạt thủ công
-bool manualLedState = false; // Trạng thái đèn thủ công
-
-// Ngưỡng cấu hình tự động
-const float TEMP_THRESHOLD = 28.0; // Ngưỡng nhiệt độ bật quạt (°C)
-const float LUX_THRESHOLD = 50.0;   // Ngưỡng ánh sáng để xác định trời tối (lux)
 bool manualMode = false;
 bool fanState = false;
 bool ledState = false;
-
+uint8_t alarmLevel = 0;
+unsigned long lastMotionMs = 0;
+unsigned long lastSensorMs = 0;
 
 void fanOn()
 {
@@ -76,160 +74,194 @@ void fanOff()
   fanState = false;
 }
 
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
+void ledOn()
 {
-  ControlData cmd;
-  memcpy(&cmd,
-         incomingData,
-         sizeof(cmd));
+  digitalWrite(LED_PIN, HIGH);
+  ledState = true;
+}
 
-  Serial.print("Command: ");
-  Serial.println(cmd.command);
+void ledOff()
+{
+  digitalWrite(LED_PIN, LOW);
+  ledState = false;
+}
 
-  if(strcmp(cmd.command,"ON")==0)
-  {
-    manualMode = true;
-
-    fanOn();
-
-    digitalWrite(LED_PIN,HIGH);
-
-    ledState = true;
-  }
-
-  else if(strcmp(cmd.command,"OFF")==0)
-  {
-    manualMode = true;
-
+void setAlarm(uint8_t level)
+{
+  alarmLevel = level;
+  if (level == 0) {
+    ledcWrite(PWM_BUZZER, 0);
+    digitalWrite(LED_PIN, LOW);
     fanOff();
-
-    digitalWrite(LED_PIN,LOW);
-
-    ledState = false;
-  }
-
-  else if(strcmp(cmd.command,"AUTO")==0)
-  {
-    manualMode = false;
+  } else if (level == 1) {
+    ledcWrite(PWM_BUZZER, BUZZER_MED_DUTY);
+    digitalWrite(LED_PIN, HIGH);
+    fanOn();
+  } else {
+    ledcWrite(PWM_BUZZER, BUZZER_MAX_DUTY);
+    digitalWrite(LED_PIN, HIGH);
+    fanOn();
   }
 }
 
+void applyCommand(const char *command)
+{
+  if (strcmp(command, "FAN_ON") == 0 || strcmp(command, "ON") == 0) {
+    manualMode = true;
+    fanOn();
+  } else if (strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0) {
+    manualMode = true;
+    fanOff();
+  } else if (strcmp(command, "LED_ON") == 0) {
+    manualMode = true;
+    ledOn();
+  } else if (strcmp(command, "LED_OFF") == 0) {
+    manualMode = true;
+    ledOff();
+  } else if (strcmp(command, "ALARM_MED") == 0) {
+    manualMode = true;      // ← thêm
+    setAlarm(1);
+  } else if (strcmp(command, "ALARM_MAX") == 0 || strcmp(command, "ALERT_ON") == 0) {
+    manualMode = true;      // ← thêm
+    setAlarm(2);
+  } else if (strcmp(command, "ALARM_OFF") == 0 || strcmp(command, "ALERT_OFF") == 0) {
+    manualMode = false;     // ← thêm, trả lại quyền tự động cho PIR/lux
+    setAlarm(0);
+  } else if (strcmp(command, "AUTO") == 0) {
+    manualMode = false;
+    setAlarm(0);
+  }
+}
+
+void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
+{
+  if (len != sizeof(ControlData)) {
+    return;
+  }
+
+  ControlData cmd;
+  memcpy(&cmd, incomingData, sizeof(cmd));
+  cmd.command[sizeof(cmd.command) - 1] = '\0';
+
+  Serial.print("Command: ");
+  Serial.println(cmd.command);
+  applyCommand(cmd.command);
+}
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
   Serial.print("Send Status: ");
-  if(status == ESP_NOW_SEND_SUCCESS)
-    Serial.println("SUCCESS");
-  else
-    Serial.println("FAIL");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
 }
 
-void readSensor(float &t, float &h, float &lux)
+void readSensor(float &t, float &h, float &lux, bool &motion)
 {
   t = dht.getTemperature();
   h = dht.getHumidity();
   lux = lightMeter.readLightLevel();
+  motion = digitalRead(PIR_PIN) == HIGH;
 }
 
-
-void sendData(float t, float h, float lux)
+void sendData(float t, float h, float lux, bool motion)
 {
   sensorData.temp = t;
   sensorData.humid = h;
-  sensorData.lux = lux;
-  esp_now_send(
-      gatewayMAC,
-      (uint8_t *)&sensorData,
-      sizeof(sensorData));
+  sensorData.light = lux;
+  sensorData.motion = motion;
+  sensorData.fan = fanState;
+  sensorData.led = ledState;
+  sensorData.alarm_level = alarmLevel;
+
+  esp_now_send(gatewayMAC, (uint8_t *)&sensorData, sizeof(sensorData));
 }
 
-// Khởi tạo ESP-NOW và thiết lập chế độ WiFi cho ESP32.
 void initESPNow()
 {
   WiFi.mode(WIFI_STA);
   Serial.print("Node MAC: ");
   Serial.println(WiFi.macAddress());
-  if(esp_now_init() != ESP_OK)
-  {
+
+  if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW Init Failed");
-    while(true);
+    while (true);
   }
 
   esp_now_register_recv_cb(OnDataRecv);
   esp_now_register_send_cb(OnDataSent);
+
   esp_now_peer_info_t peerInfo = {};
-
   memcpy(peerInfo.peer_addr, gatewayMAC, 6);
-
   peerInfo.channel = 0;
   peerInfo.encrypt = false;
 
-  if(esp_now_add_peer(&peerInfo) != ESP_OK)
-  {
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
     Serial.println("Add Peer Failed");
-    while(true);
+    while (true);
   }
 
   Serial.println("ESP-NOW READY");
 }
 
-
-void setup() {
+void setup()
+{
   Serial.begin(115200);
+
   dht.setup(DHTPIN, DHT::DHT22);
   Wire.begin(I2C_SDA, I2C_SCL);
   lightMeter.begin();
-  
+
   pinMode(PIR_PIN, INPUT);
-  
-  // Cấu hình chân Quạt
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
   ledcSetup(PWM_A, PWM_FREQ, PWM_RES);
   ledcSetup(PWM_B, PWM_FREQ, PWM_RES);
+  ledcSetup(PWM_BUZZER, BUZZER_PWM_FREQ, PWM_RES);
   ledcAttachPin(INA, PWM_A);
   ledcAttachPin(INB, PWM_B);
-  
-  // Cấu hình chân Đèn LED, Buzzer
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(BUZZER,OUTPUT);
-  digitalWrite(BUZZER,LOW); // Tắt buzzer lúc mới khởi động
-  digitalWrite(LED_PIN, LOW); // Tắt đèn lúc mới khởi động
-  
-    initESPNow();
-  Serial.println("NODE READY");
+  ledcAttachPin(BUZZER, PWM_BUZZER);
 
+  fanOff();
+  ledOff();
+  setAlarm(0);
+
+  initESPNow();
+  Serial.println("BEDROOM NODE READY");
 }
 
-void loop() {
-  float t,h,lux;
-  readSensor(t, h, lux);
-  Serial.printf("T=%.1f H=%.1f LUX=%.2f\n",t,h,lux);
-  sendData(t,h,lux);
 
-  if(!manualMode)
-  {
-    // Chế độ tự động
-    if(t > TEMP_THRESHOLD)
-    {
-      fanOn();
-      digitalWrite(BUZZER, HIGH);
-    }
-    else
-    {
-      fanOff();
-      digitalWrite(BUZZER, LOW);
-    }
 
-    if(lux < LUX_THRESHOLD)
-    {
-      digitalWrite(LED_PIN, HIGH);
-      ledState = true;
-    }
-    else
-    {
-      digitalWrite(LED_PIN, LOW);
-      ledState = false;
-    }
+void loop()
+{
+  unsigned long now = millis();
+  if (now - lastSensorMs < SENSOR_INTERVAL_MS) {
+    return;
+  }
+  lastSensorMs = now;
+
+  float t, h, lux;
+  bool motion;
+  readSensor(t, h, lux, motion);
+
+  if (motion) {
+    lastMotionMs = now;
   }
 
-  delay(3000);
+  Serial.printf("T=%.1f H=%.1f LUX=%.2f PIR=%d\n", t, h, lux, motion ? 1 : 0);
+  sendData(t, h, lux, motion);
+
+  if (!manualMode) {
+    bool holdFan = motion || (now - lastMotionMs < FAN_OFF_DELAY_MS);
+    if (holdFan) {
+      fanOn();
+    } else {
+      fanOff();
+    }
+
+    if (lux < LUX_THRESHOLD && motion) {
+      ledOn();
+    } else {
+      ledOff();
+    }
+  }
 }
