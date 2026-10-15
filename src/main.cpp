@@ -2,9 +2,11 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <ArduinoOTA.h>
 #include <BH1750.h>
 #include "DHT.h"
 
+// ===================== PIN / PWM =====================
 #define DHTPIN 4
 #define BUZZER 45
 
@@ -29,6 +31,15 @@
 
 #define SENSOR_INTERVAL_MS 2000UL
 #define FAN_OFF_DELAY_MS 60000UL
+
+// ===================== OTA CONFIG =====================
+// Kitchen node: doi OTA_HOSTNAME thanh "kitchen-node"
+#define OTA_HOSTNAME        "bedroom-node"
+#define OTA_PASSWORD        "Bedroom@k18"
+#define OTA_WIFI_SSID       "hvt"
+#define OTA_WIFI_PASS       "10012511"
+#define OTA_WINDOW_MS       300000UL   // 5 phut cho phep upload
+#define OTA_WIFI_TIMEOUT_MS 15000UL    // timeout ket noi WiFi
 
 DHT dht;
 BH1750 lightMeter;
@@ -60,6 +71,12 @@ uint8_t alarmLevel = 0;
 unsigned long lastMotionMs = 0;
 unsigned long lastSensorMs = 0;
 
+// OTA state
+volatile bool otaRequested = false;  // dat trong callback ESP-NOW, xu ly trong loop()
+bool otaMode = false;
+unsigned long otaStartMs = 0;
+
+// ===================== ACTUATORS =====================
 void fanOn()
 {
   ledcWrite(PWM_A, 0);
@@ -104,6 +121,7 @@ void setAlarm(uint8_t level)
   }
 }
 
+// ===================== COMMAND HANDLING =====================
 void applyCommand(const char *command)
 {
   if (strcmp(command, "FAN_ON") == 0 || strcmp(command, "ON") == 0) {
@@ -119,17 +137,19 @@ void applyCommand(const char *command)
     manualMode = true;
     ledOff();
   } else if (strcmp(command, "ALARM_MED") == 0) {
-    manualMode = true;      // ← thêm
+    manualMode = true;
     setAlarm(1);
   } else if (strcmp(command, "ALARM_MAX") == 0 || strcmp(command, "ALERT_ON") == 0) {
-    manualMode = true;      // ← thêm
+    manualMode = true;
     setAlarm(2);
   } else if (strcmp(command, "ALARM_OFF") == 0 || strcmp(command, "ALERT_OFF") == 0) {
-    manualMode = false;     // ← thêm, trả lại quyền tự động cho PIR/lux
+    manualMode = false;
     setAlarm(0);
   } else if (strcmp(command, "AUTO") == 0) {
     manualMode = false;
     setAlarm(0);
+  } else if (strcmp(command, "OTA") == 0) {
+    otaRequested = true;  // chi dat co, loop() se xu ly
   }
 }
 
@@ -154,6 +174,7 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
 }
 
+// ===================== SENSORS =====================
 void readSensor(float &t, float &h, float &lux, bool &motion)
 {
   t = dht.getTemperature();
@@ -175,6 +196,7 @@ void sendData(float t, float h, float lux, bool motion)
   esp_now_send(gatewayMAC, (uint8_t *)&sensorData, sizeof(sensorData));
 }
 
+// ===================== ESP-NOW =====================
 void initESPNow()
 {
   WiFi.mode(WIFI_STA);
@@ -202,6 +224,54 @@ void initESPNow()
   Serial.println("ESP-NOW READY");
 }
 
+// ===================== OTA =====================
+void enterOtaMode()
+{
+  Serial.println("Entering OTA mode...");
+
+  // An toan: tat toan bo co cau chap hanh truoc khi nap
+  fanOff();
+  ledOff();
+  setAlarm(0);
+
+  // Ngat ESP-NOW de radio duoc tu do ket noi router
+  esp_now_deinit();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(OTA_HOSTNAME);
+  WiFi.begin(OTA_WIFI_SSID, OTA_WIFI_PASS);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - t0 > OTA_WIFI_TIMEOUT_MS) {
+      Serial.println("OTA WiFi failed, restarting");
+      ESP.restart();
+    }
+    delay(200);
+  }
+
+  Serial.print("OTA IP: ");
+  Serial.println(WiFi.localIP());
+
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+  ArduinoOTA.onStart([]() { Serial.println("OTA start"); });
+  ArduinoOTA.onEnd([]() { Serial.println("\nOTA end"); });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA %u%%\r", progress * 100 / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error %u, restarting\n", error);
+    ESP.restart();
+  });
+  ArduinoOTA.begin();
+
+  otaMode = true;
+  otaStartMs = millis();
+  Serial.println("OTA READY (waiting for upload)");
+}
+
+// ===================== SETUP / LOOP =====================
 void setup()
 {
   Serial.begin(115200);
@@ -229,10 +299,22 @@ void setup()
   Serial.println("BEDROOM NODE READY");
 }
 
-
-
 void loop()
 {
+  // --- Che do OTA: chi phuc vu upload, het han thi khoi dong lai ---
+  if (otaRequested && !otaMode) {
+    enterOtaMode();
+  }
+  if (otaMode) {
+    ArduinoOTA.handle();
+    if (millis() - otaStartMs > OTA_WINDOW_MS) {
+      Serial.println("OTA timeout, restarting");
+      ESP.restart();
+    }
+    return;
+  }
+
+  // --- Che do binh thuong ---
   unsigned long now = millis();
   if (now - lastSensorMs < SENSOR_INTERVAL_MS) {
     return;
