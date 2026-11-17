@@ -86,8 +86,8 @@ unsigned long lastMotionMs = 0;
 unsigned long lastSensorMs = 0;
 
 // ---- Ghi de tu nut nhan (manual) ----
-bool fanOverride = false;   // true: nut nhan dang quyet dinh quat
-bool ledOverride = false;   // true: nut nhan dang quyet dinh den
+bool fanOverride = false;    // true: nut nhan dang quyet dinh quat
+bool ledOverride = false;    // true: nut nhan dang quyet dinh den
 unsigned long lastBtnMs = 0; // lan nhan nut gan nhat (cho bo dem 30 phut)
 
 // ---- Snapshot trang thai truoc bao dong de khoi phuc ----
@@ -107,8 +107,19 @@ volatile bool otaRequested = false;
 bool otaMode = false;
 unsigned long otaStartMs = 0;
 
-// Prototype (an toan neu build bang PlatformIO / .cpp)
+// ===================== PROTOTYPES (can cho .cpp) =====================
+void fanOn();
+void fanOff();
+void ledOn();
+void ledOff();
+void setAlarm(uint8_t level);
 void updateButtonLamps();
+void snapshotBeforeAlarm();
+void restoreAfterAlarm();
+void blinkLamp(uint8_t pin);
+void handleButtons();
+void applyCommand(const char *command);
+void enterOtaMode();
 
 // ===================== BUTTON =====================
 enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
@@ -333,13 +344,17 @@ void applyCommand(const char *command)
     manualMode = true;
     setAlarm(2);
   } else if (strcmp(command, "ALARM_OFF") == 0 || strcmp(command, "ALERT_OFF") == 0) {
+    // Gateway gui ALARM_OFF nhieu lan (chong mat goi ESP-NOW), nen ba truong hop:
     if (preAlarm.valid) {
-      restoreAfterAlarm();
-    } else {                          // khong co snapshot: ve auto nhu cu
+      restoreAfterAlarm();            // goi dau tien: khoi phuc trang thai truoc bao dong
+    } else if (alarmLevel > 0) {      // dang bao ma khong co snapshot: ve auto nhu cu
       manualMode = false;
       fanOverride = false;
       ledOverride = false;
       setAlarm(0);
+    } else {
+      // Goi lap lai sau khi da het bao dong: bo qua, khong pha ket qua khoi phuc
+      Serial.println("ALARM_OFF lap lai: bo qua (da het bao dong)");
     }
   } else if (strcmp(command, "AUTO") == 0) {
     preAlarm.valid = false;           // lenh AUTO tuong minh thang snapshot
