@@ -22,30 +22,48 @@
 // ---- Nut nhan tich hop LED ----
 // SIG2: ngo ra trang thai nut (mac dinh HIGH, nhan = LOW)
 // SIG1: ngo vao dieu khien LED nut (mac dinh LOW, HIGH = sang)
-#define BTN_LED_SIG1     5   // Nut vang (den)
-#define BTN_LED_SIG2     6
-#define BTN_FAN_SIG1     7   // Nut xanh (quat)
-#define BTN_FAN_SIG2     8
-#define BTN_DEBOUNCE_MS  30UL
-#define BTN_LONG_PRESS_MS 2000UL       // giu nut bao lau thi ve tu dong
-#define OVERRIDE_RELEASE_MS 1800000UL  // 30 phut khong co hoat dong -> tu ve auto (dat 0 de tat)
+#define BTN_LED_SIG1        5   // Nut vang (den)
+#define BTN_LED_SIG2        6
+#define BTN_FAN_SIG1        7   // Nut xanh (quat)
+#define BTN_FAN_SIG2        8
+#define BTN_DEBOUNCE_MS     30UL
+#define BTN_LONG_PRESS_MS   2000UL       // giu nut bao lau thi ve tu dong
+#define OVERRIDE_RELEASE_MS 1800000UL    // 30 phut khong co hoat dong -> tu ve auto (dat 0 de tat)
 
-#define PWM_A 0
-#define PWM_B 1
-#define PWM_BUZZER 2
-#define PWM_FREQ 5000
+#define PWM_A           0
+#define PWM_B           1
+#define PWM_BUZZER      2
+#define PWM_FREQ        5000
 #define BUZZER_PWM_FREQ 2000
-#define PWM_RES 8
-#define FAN_SPEED 200
+#define PWM_RES         8
+#define FAN_SPEED       200
 #define BUZZER_MED_DUTY 128
 #define BUZZER_MAX_DUTY 255
 
 #define SENSOR_INTERVAL_MS 2000UL
-#define FAN_OFF_DELAY_MS 5000UL
+#define PRESENCE_HOLD_MS   4500UL   // Giữ thêm 4,5 giây kể từ khi xác nhận xung đã xuống LOW.
 
 // ---- Nguong nhiet do cho quat tu dong ----
 #define FAN_TEMP_ON_C   28.0f   // >= nhiet do nay thi cho phep bat quat
 #define FAN_TEMP_OFF_C  26.0f   // <= nhiet do nay thi tat quat (tranh bat/tat lien tuc)
+
+// ===================== PIR FILTER =====================
+#define PIR_WARMUP_MS          60000UL
+#define PIR_SAMPLE_INTERVAL_MS 20UL
+#define PIR_HIGH_CONFIRM_MS    600UL
+#define PIR_LOW_CONFIRM_MS     400UL
+
+// Đổi thành true rồi nạp qua USB để chỉ đọc GPIO14 và in Serial.
+constexpr bool PIR_RAW_ONLY = false;
+
+enum class PirPhase { Warmup, WaitLow, Ready };
+PirPhase pirPhase = PirPhase::Warmup;
+int pirRaw = -1;                       // Chưa lấy mẫu.
+bool pirFilteredState = false;
+bool pirHoldActive = false;
+unsigned long pirStableSinceMs = 0;
+unsigned long pirLastSampleMs = 0;
+unsigned long bootMs = 0;
 
 // ===================== OTA CONFIG =====================
 #define OTA_HOSTNAME        "bedroom-node"
@@ -76,7 +94,7 @@ typedef struct __attribute__((packed)) {
 
 SensorData sensorData;
 
-const float LUX_THRESHOLD = 50.0;
+const float LUX_THRESHOLD = 50.0f;
 
 bool manualMode = false;
 bool fanState = false;
@@ -107,7 +125,7 @@ volatile bool otaRequested = false;
 bool otaMode = false;
 unsigned long otaStartMs = 0;
 
-// ===================== PROTOTYPES (can cho .cpp) =====================
+// ===================== PROTOTYPES =====================
 void fanOn();
 void fanOff();
 void ledOn();
@@ -119,6 +137,9 @@ void restoreAfterAlarm();
 void blinkLamp(uint8_t pin);
 void handleButtons();
 void applyCommand(const char *command);
+void updatePirFilter();
+void sendData(float t, float h, float lux, bool motion);
+void initESPNow();
 void enterOtaMode();
 
 // ===================== BUTTON =====================
@@ -136,8 +157,6 @@ struct Button {
 Button btnLed = {BTN_LED_SIG2, HIGH, HIGH, 0, 0, false};
 Button btnFan = {BTN_FAN_SIG2, HIGH, HIGH, 0, 0, false};
 
-// Nhan ngan: tra ve BTN_SHORT khi tha nut.
-// Nhan giu: tra ve BTN_LONG ngay khi du thoi gian (khi dang giu).
 BtnEvent readButton(Button &b)
 {
   bool reading = digitalRead(b.pin);
@@ -150,10 +169,10 @@ BtnEvent readButton(Button &b)
 
   if ((now - b.lastChangeMs) > BTN_DEBOUNCE_MS && reading != b.stableState) {
     b.stableState = reading;
-    if (b.stableState == LOW) {          // vua nhan xuong
+    if (b.stableState == LOW) {
       b.pressStartMs = now;
       b.longFired = false;
-    } else if (!b.longFired) {           // vua tha ra, chua phai nhan giu
+    } else if (!b.longFired) {
       return BTN_SHORT;
     }
   }
@@ -169,7 +188,7 @@ BtnEvent readButton(Button &b)
 // ===================== ACTUATORS =====================
 void fanOn()
 {
-  if (fanState) return;               // dang chay roi, khong ramp lai
+  if (fanState) return;
   ledcWrite(PWM_A, 0);
   for (int speed = 0; speed <= FAN_SPEED; speed += 10)
   {
@@ -216,14 +235,12 @@ void setAlarm(uint8_t level)
   }
 }
 
-// Chup trang thai truoc khi vao bao dong (chi chup o lan bao dau tien)
 void snapshotBeforeAlarm()
 {
   if (alarmLevel != 0 || preAlarm.valid) return;
   preAlarm = {true, manualMode, fanOverride, ledOverride, fanState, ledState};
 }
 
-// Het bao dong: khoi phuc trang thai truoc do
 void restoreAfterAlarm()
 {
   PreAlarmSnapshot snap = preAlarm;
@@ -236,7 +253,6 @@ void restoreAfterAlarm()
   fanOverride = snap.fanOverride;
   ledOverride = snap.ledOverride;
 
-  // Thiet bi dang manual: tra dung ON/OFF truoc bao dong
   if (manualMode || fanOverride) {
     if (snap.fan) fanOn(); else fanOff();
   }
@@ -244,14 +260,12 @@ void restoreAfterAlarm()
     if (snap.led) ledOn(); else ledOff();
   }
 
-  lastBtnMs = millis();                         // bo dem 30 phut bat dau lai
-  lastSensorMs = millis() - SENSOR_INTERVAL_MS; // thiet bi auto tu danh gia lai ngay
+  lastBtnMs = millis();
+  lastSensorMs = millis() - SENSOR_INTERVAL_MS;
   updateButtonLamps();
   Serial.println("Alarm cleared: restored previous state");
 }
 
-// Den tren CA 2 NUT deu theo trang thai LED chieu sang:
-// LED tat -> 2 den nut sang (SIG1 = HIGH); LED bat -> 2 den nut tat.
 void updateButtonLamps()
 {
   bool lampOn = !ledState;
@@ -259,7 +273,6 @@ void updateButtonLamps()
   digitalWrite(BTN_FAN_SIG1, lampOn ? HIGH : LOW);
 }
 
-// Nhay den trong nut 3 lan de bao "da ve tu dong"
 void blinkLamp(uint8_t pin)
 {
   for (int i = 0; i < 3; i++) {
@@ -270,11 +283,9 @@ void blinkLamp(uint8_t pin)
 
 void handleButtons()
 {
-  // Doc ca hai nut MOT lan duy nhat moi vong lap
   BtnEvent eled = readButton(btnLed);
   BtnEvent efan = readButton(btnFan);
 
-  // An toan: dang bao dong thi bo qua nut
   if (alarmLevel > 0) {
     if (eled != BTN_NONE || efan != BTN_NONE) {
       Serial.println("Alarm active: ignore button press");
@@ -282,7 +293,6 @@ void handleButtons()
     return;
   }
 
-  // ---- Nut vang: den ----
   if (eled == BTN_SHORT) {
     ledOverride = true;
     lastBtnMs = millis();
@@ -292,11 +302,10 @@ void handleButtons()
     ledOverride = false;
     manualMode = false;
     blinkLamp(BTN_LED_SIG1);
-    lastSensorMs = millis() - SENSOR_INTERVAL_MS;  // danh gia lai ngay
+    lastSensorMs = millis() - SENSOR_INTERVAL_MS;
     Serial.println("Button LED -> AUTO");
   }
 
-  // ---- Nut xanh: quat ----
   if (efan == BTN_SHORT) {
     fanOverride = true;
     lastBtnMs = millis();
@@ -314,7 +323,6 @@ void handleButtons()
 // ===================== COMMAND HANDLING =====================
 void applyCommand(const char *command)
 {
-  // Dang bao dong: chan lenh den/quat thu cong
   if (alarmLevel > 0 &&
       (strcmp(command, "FAN_ON") == 0  || strcmp(command, "ON") == 0  ||
        strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0 ||
@@ -336,7 +344,7 @@ void applyCommand(const char *command)
     manualMode = true;
     ledOff();
   } else if (strcmp(command, "ALARM_MED") == 0) {
-    snapshotBeforeAlarm();            // phai dung TRUOC manualMode = true
+    snapshotBeforeAlarm();
     manualMode = true;
     setAlarm(1);
   } else if (strcmp(command, "ALARM_MAX") == 0 || strcmp(command, "ALERT_ON") == 0) {
@@ -344,20 +352,18 @@ void applyCommand(const char *command)
     manualMode = true;
     setAlarm(2);
   } else if (strcmp(command, "ALARM_OFF") == 0 || strcmp(command, "ALERT_OFF") == 0) {
-    // Gateway gui ALARM_OFF nhieu lan (chong mat goi ESP-NOW), nen ba truong hop:
     if (preAlarm.valid) {
-      restoreAfterAlarm();            // goi dau tien: khoi phuc trang thai truoc bao dong
-    } else if (alarmLevel > 0) {      // dang bao ma khong co snapshot: ve auto nhu cu
+      restoreAfterAlarm();
+    } else if (alarmLevel > 0) {
       manualMode = false;
       fanOverride = false;
       ledOverride = false;
       setAlarm(0);
     } else {
-      // Goi lap lai sau khi da het bao dong: bo qua, khong pha ket qua khoi phuc
       Serial.println("ALARM_OFF lap lai: bo qua (da het bao dong)");
     }
   } else if (strcmp(command, "AUTO") == 0) {
-    preAlarm.valid = false;           // lenh AUTO tuong minh thang snapshot
+    preAlarm.valid = false;
     manualMode = false;
     fanOverride = false;
     ledOverride = false;
@@ -388,15 +394,64 @@ void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
 }
 
-// ===================== SENSORS =====================
-void readSensor(float &t, float &h, float &lux, bool &motion)
+// ===================== PIR FILTER =====================
+const char *pirPhaseName()
 {
-  t = dht.getTemperature();
-  h = dht.getHumidity();
-  lux = lightMeter.readLightLevel();
-  motion = digitalRead(PIR_PIN) == HIGH;
+  switch (pirPhase) {
+    case PirPhase::Warmup:  return "WARMUP";
+    case PirPhase::WaitLow: return "WAIT_LOW";
+    case PirPhase::Ready:   return "READY";
+  }
+  return "?";
 }
 
+void updatePirFilter()
+{
+  const unsigned long now = millis();
+  const unsigned long sampleGap = now - pirLastSampleMs;
+  if (sampleGap < PIR_SAMPLE_INTERVAL_MS) return;
+  pirLastSampleMs = now;
+
+  const int raw = digitalRead(PIR_PIN);
+  const bool changed = (raw != pirRaw);
+  pirRaw = raw;
+  static unsigned long lastRawLogMs = 0;
+  if (changed || (PIR_RAW_ONLY && now - lastRawLogMs >= 1000UL)) {
+    Serial.printf("[PIR] t=%lu ms GPIO%d RAW=%d\n", now, PIR_PIN, raw);
+    lastRawLogMs = now;
+  }
+  if (PIR_RAW_ONLY) return;
+
+  // Nếu loop bận (chớp đèn nút, khởi động quạt), xác nhận lại từ mẫu mới.
+  if (changed || sampleGap > 3 * PIR_SAMPLE_INTERVAL_MS) pirStableSinceMs = now;
+
+  if (pirPhase == PirPhase::Warmup) {
+    if (now - bootMs < PIR_WARMUP_MS) return;
+    pirPhase = PirPhase::WaitLow;
+    pirStableSinceMs = now;
+    Serial.println("[PIR] WAIT_LOW");
+  }
+
+  const unsigned long stableMs = now - pirStableSinceMs;
+  if (pirPhase == PirPhase::WaitLow) {
+    if (raw == LOW && stableMs >= PIR_LOW_CONFIRM_MS) {
+      pirPhase = PirPhase::Ready;
+      Serial.println("[PIR] READY");
+    }
+    return;
+  }
+
+  const bool high = (raw == HIGH);
+  const unsigned long confirmMs = high ? PIR_HIGH_CONFIRM_MS : PIR_LOW_CONFIRM_MS;
+  if (high == pirFilteredState || stableMs < confirmMs) return;
+
+  pirFilteredState = high;
+  lastMotionMs = now;
+  pirHoldActive = !high;  // Bắt đầu giữ khi xác nhận LOW, hủy giữ khi có xung HIGH mới.
+  Serial.printf("[PIR] t=%lu ms FLT=%d\n", now, high ? 1 : 0);
+}
+
+// ===================== ESP-NOW =====================
 void sendData(float t, float h, float lux, bool motion)
 {
   sensorData.temp = t;
@@ -410,10 +465,10 @@ void sendData(float t, float h, float lux, bool motion)
   esp_now_send(gatewayMAC, (uint8_t *)&sensorData, sizeof(sensorData));
 }
 
-// ===================== ESP-NOW =====================
 void initESPNow()
 {
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);  // Giam cong suat phat de chong nhieu RF sang PIR
   Serial.print("Node MAC: ");
   Serial.println(WiFi.macAddress());
 
@@ -449,6 +504,7 @@ void enterOtaMode()
   esp_now_deinit();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Tang lai cong suat toi da khi ket noi Wi-Fi OTA
   WiFi.setHostname(OTA_HOSTNAME);
   WiFi.begin(OTA_WIFI_SSID, OTA_WIFI_PASS);
 
@@ -487,16 +543,22 @@ void setup()
 {
   Serial.begin(115200);
 
+  pinMode(PIR_PIN, INPUT_PULLDOWN);
+  bootMs = millis();
+  pirLastSampleMs = bootMs;
+  if (PIR_RAW_ONLY) {
+    Serial.println("[PIR] RAW_ONLY");
+    return;
+  }
+  Serial.printf("[PIR] WARMUP %lu s\n", PIR_WARMUP_MS / 1000UL);
+
   dht.setup(DHTPIN, DHT::DHT22);
   Wire.begin(I2C_SDA, I2C_SCL);
   lightMeter.begin();
 
-  pinMode(PIR_PIN, INPUT);
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUZZER, OUTPUT);
 
-  // Nut nhan: SIG2 la ngo ra cua module (mac dinh HIGH) -> doc vao
-  //           SIG1 la ngo vao cua module (mac dinh LOW)  -> xuat ra
   pinMode(BTN_LED_SIG2, INPUT_PULLUP);
   pinMode(BTN_FAN_SIG2, INPUT_PULLUP);
   pinMode(BTN_LED_SIG1, OUTPUT);
@@ -515,11 +577,21 @@ void setup()
   updateButtonLamps();
 
   initESPNow();
+
+  delay(200);
+  neopixelWrite(48, 0, 0, 0);
+
   Serial.println("BEDROOM NODE READY");
 }
 
 void loop()
 {
+  if (PIR_RAW_ONLY) {
+    updatePirFilter();
+    delay(1);
+    return;
+  }
+
   // --- Che do OTA ---
   if (otaRequested && !otaMode) {
     enterOtaMode();
@@ -533,62 +605,75 @@ void loop()
     return;
   }
 
-  // --- Nut nhan: quet lien tuc, phan hoi ngay ---
+  // --- Nut nhan & loc PIR: quet lien tuc ---
   handleButtons();
   updateButtonLamps();
+  updatePirFilter();
 
-  // --- Che do binh thuong (chu ky 2s) ---
   unsigned long now = millis();
-  if (now - lastSensorMs < SENSOR_INTERVAL_MS) {
+  static float lastT = NAN, lastH = NAN, lastLux = 0.0f;
+  static bool lastPresence = false;
+
+  // 1. Trang thai co nguoi cap nhat ngay khi PIR doi trang thai
+  const bool motion = pirFilteredState;
+  if (pirHoldActive && now - lastMotionMs >= PRESENCE_HOLD_MS) pirHoldActive = false;
+  const bool presence = motion || pirHoldActive;
+  bool presenceChanged = (presence != lastPresence);
+  lastPresence = presence;
+
+  bool sensorDue = (now - lastSensorMs >= SENSOR_INTERVAL_MS);
+  if (!sensorDue && !presenceChanged) {
     return;
   }
-  lastSensorMs = now;
 
-  float t, h, lux;
-  bool motion;
-  readSensor(t, h, lux, motion);
+  // 2. Chi doc DHT22 theo chu ky 2s
+  if (sensorDue) {
+    lastSensorMs = now;
+    lastT = dht.getTemperature();
+    lastH = dht.getHumidity();
+    lastLux = lightMeter.readLightLevel();
 
-  if (motion) {
-    lastMotionMs = now;
-  }
-
-  // Cap nhat trang thai nhiet do co tre (bo qua neu DHT doc loi)
-  if (!isnan(t)) {
-    if (t >= FAN_TEMP_ON_C) tempHot = true;
-    else if (t <= FAN_TEMP_OFF_C) tempHot = false;
-  }
-
-  // Khong co hoat dong (chuyen dong / nhan nut) du lau -> tu tra ve auto
-  // (OVERRIDE_RELEASE_MS = 0: tat tinh nang nay)
-  unsigned long lastActivity = (lastMotionMs > lastBtnMs) ? lastMotionMs : lastBtnMs;
-  if (OVERRIDE_RELEASE_MS > 0 && !motion &&
-      (now - lastActivity >= OVERRIDE_RELEASE_MS)) {
-    if (fanOverride || ledOverride) {
-      Serial.println("No presence: release button override");
+    if (!isnan(lastT)) {
+      if (lastT >= FAN_TEMP_ON_C) tempHot = true;
+      else if (lastT <= FAN_TEMP_OFF_C) tempHot = false;
     }
-    fanOverride = false;
-    ledOverride = false;
+
+    unsigned long lastActivity = (lastMotionMs > lastBtnMs) ? lastMotionMs : lastBtnMs;
+    if (OVERRIDE_RELEASE_MS > 0 && !presence &&
+        (now - lastActivity >= OVERRIDE_RELEASE_MS)) {
+      if (fanOverride || ledOverride) {
+        Serial.println("No presence: release button override");
+      }
+      fanOverride = false;
+      ledOverride = false;
+    }
+  } else if (presence) {
+    lastLux = lightMeter.readLightLevel();
   }
 
-  Serial.printf("T=%.1f H=%.1f LUX=%.2f PIR=%d HOT=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
-                t, h, lux, motion ? 1 : 0, tempHot ? 1 : 0,
-                fanState ? 1 : 0, ledState ? 1 : 0,
+  // 3. Dieu khien thiet bi
+  if (!manualMode) {
+    if (!fanOverride) {
+      if (presence && tempHot) fanOn();
+      else fanOff();
+    }
+    if (!ledOverride) {
+      if (!presence) {
+        ledOff();
+      } else if (!ledState && lastLux >= 0.0f && lastLux < LUX_THRESHOLD) {
+        ledOn();
+      }
+    }
+  }
+
+  // 4. Gửi theo chu kỳ hoặc ngay khi PRES đổi, kể cả lúc DHT22 chưa có số đo.
+  Serial.printf("T=%.1f H=%.1f LUX=%.2f PIR=%s RAW=%d FLT=%d PRES=%d HOT=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
+                lastT, lastH, lastLux, pirPhaseName(),
+                pirRaw, motion ? 1 : 0, presence ? 1 : 0,
+                tempHot ? 1 : 0, fanState ? 1 : 0, ledState ? 1 : 0,
                 fanOverride ? 1 : 0, ledOverride ? 1 : 0, manualMode ? 1 : 0);
 
-  if (!manualMode) {
-    // Quat: tu dong khi nut xanh KHONG o manual
-    // Bat khi (co nguoi hoac vua co nguoi < 5s) VA nhiet do cao
-    if (!fanOverride) {
-      bool presence = motion || (now - lastMotionMs < FAN_OFF_DELAY_MS);
-      if (presence && tempHot) fanOn(); else fanOff();
-    }
-
-    // Den: tu dong khi nut vang KHONG o manual
-    if (!ledOverride) {
-      if (lux < LUX_THRESHOLD && motion) ledOn(); else ledOff();
-    }
-  }
-
+  neopixelWrite(48, 0, 0, 0);
   updateButtonLamps();
-  sendData(t, h, lux, motion);
+  sendData(lastT, lastH, lastLux, presence);
 }
