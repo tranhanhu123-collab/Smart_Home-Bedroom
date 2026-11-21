@@ -41,7 +41,10 @@
 #define BUZZER_MAX_DUTY 255
 
 #define SENSOR_INTERVAL_MS 2000UL
-#define PRESENCE_HOLD_MS   4500UL   // Giữ thêm 4,5 giây kể từ khi xác nhận xung đã xuống LOW.
+#define PRESENCE_HOLD_MS   3500UL   // Giữ thêm 3,5 giây sau LOW để qua khoảng nghỉ giữa hai xung.
+// Khi trình diễn, xác nhận ngay ở cạnh lên thứ hai nếu hai cạnh đã lọc cách nhau 1,5–10 giây.
+constexpr unsigned long ENTRY_MIN_INTERVAL_MS = 1500UL;
+constexpr unsigned long ENTRY_WINDOW_MS = 10000UL;
 
 // ---- Nguong nhiet do cho quat tu dong ----
 #define FAN_TEMP_ON_C   28.0f   // >= nhiet do nay thi cho phep bat quat
@@ -50,7 +53,7 @@
 // ===================== PIR FILTER =====================
 #define PIR_WARMUP_MS          60000UL
 #define PIR_SAMPLE_INTERVAL_MS 20UL
-#define PIR_HIGH_CONFIRM_MS    600UL
+#define PIR_HIGH_CONFIRM_MS    450UL
 #define PIR_LOW_CONFIRM_MS     400UL
 
 // Đổi thành true rồi nạp qua USB để chỉ đọc GPIO14 và in Serial.
@@ -60,7 +63,6 @@ enum class PirPhase { Warmup, WaitLow, Ready };
 PirPhase pirPhase = PirPhase::Warmup;
 int pirRaw = -1;                       // Chưa lấy mẫu.
 bool pirFilteredState = false;
-bool pirHoldActive = false;
 unsigned long pirStableSinceMs = 0;
 unsigned long pirLastSampleMs = 0;
 unsigned long bootMs = 0;
@@ -446,9 +448,40 @@ void updatePirFilter()
   if (high == pirFilteredState || stableMs < confirmMs) return;
 
   pirFilteredState = high;
-  lastMotionMs = now;
-  pirHoldActive = !high;  // Bắt đầu giữ khi xác nhận LOW, hủy giữ khi có xung HIGH mới.
   Serial.printf("[PIR] t=%lu ms FLT=%d\n", now, high ? 1 : 0);
+}
+
+bool updateRoomPresence(bool motion, unsigned long now)
+{
+  enum class RoomState { Empty, WaitingForSecondPulse, Occupied };
+  static RoomState state = RoomState::Empty;
+  static unsigned long firstPulseMs = 0;
+  static bool previousMotion = false;
+
+  // Xét hết hạn trước khi xử lý cạnh mới, kể cả khi vòng lặp vừa bị trễ.
+  if (state == RoomState::WaitingForSecondPulse && now - firstPulseMs > ENTRY_WINDOW_MS) {
+    state = RoomState::Empty;
+    Serial.println("[ROOM] EMPTY (entry window expired)");
+  } else if (state == RoomState::Occupied && !previousMotion &&
+             now - lastMotionMs >= PRESENCE_HOLD_MS) {
+    state = RoomState::Empty;
+    Serial.println("[ROOM] EMPTY");
+  }
+
+  if (motion != previousMotion) {
+    previousMotion = motion;
+    lastMotionMs = now;
+    if (motion && state == RoomState::Empty) {
+      firstPulseMs = now;
+      state = RoomState::WaitingForSecondPulse;
+      Serial.println("[ROOM] WAIT_SECOND");
+    } else if (motion && state == RoomState::WaitingForSecondPulse &&
+               now - firstPulseMs >= ENTRY_MIN_INTERVAL_MS) {
+      state = RoomState::Occupied;
+      Serial.println("[ROOM] OCCUPIED");
+    }
+  }
+  return state == RoomState::Occupied;
 }
 
 // ===================== ESP-NOW =====================
@@ -614,10 +647,9 @@ void loop()
   static float lastT = NAN, lastH = NAN, lastLux = 0.0f;
   static bool lastPresence = false;
 
-  // 1. Trang thai co nguoi cap nhat ngay khi PIR doi trang thai
+  // 1. Xác nhận có người trước khi điều khiển tự động hoặc báo lên gateway.
   const bool motion = pirFilteredState;
-  if (pirHoldActive && now - lastMotionMs >= PRESENCE_HOLD_MS) pirHoldActive = false;
-  const bool presence = motion || pirHoldActive;
+  const bool presence = updateRoomPresence(motion, now);
   bool presenceChanged = (presence != lastPresence);
   lastPresence = presence;
 
@@ -658,7 +690,7 @@ void loop()
       else fanOff();
     }
     if (!ledOverride) {
-      if (!presence) {
+      if (!presence || lastLux >= LUX_THRESHOLD) {
         ledOff();
       } else if (!ledState && lastLux >= 0.0f && lastLux < LUX_THRESHOLD) {
         ledOn();
