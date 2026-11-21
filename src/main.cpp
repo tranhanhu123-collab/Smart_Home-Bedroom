@@ -2,9 +2,12 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <ArduinoOTA.h>
 #include <BH1750.h>
 #include "DHT.h"
+#include <cmath>
 
 // ===================== PIN / PWM =====================
 #define DHTPIN 4
@@ -36,25 +39,28 @@
 #define PWM_FREQ        5000
 #define BUZZER_PWM_FREQ 2000
 #define PWM_RES         8
-#define FAN_SPEED       200
+constexpr uint8_t FAN_HIGH = 3;
+constexpr uint8_t FAN_PWM[] = {0, 100, 150, 200};  // Tắt, nhẹ, trung bình, mạnh (PWM 8 bit).
+constexpr unsigned long FAN_TAP_GAP_MS = 500UL;
+constexpr unsigned long FAN_RAMP_MS = 300UL;
+constexpr unsigned long FAN_START_HOLD_MS = 120UL;
 #define BUZZER_MED_DUTY 128
 #define BUZZER_MAX_DUTY 255
 
 #define SENSOR_INTERVAL_MS 2000UL
-#define PRESENCE_HOLD_MS   3500UL   // Giữ thêm 3,5 giây sau LOW để qua khoảng nghỉ giữa hai xung.
-// Khi trình diễn, xác nhận ngay ở cạnh lên thứ hai nếu hai cạnh đã lọc cách nhau 1,5–10 giây.
-constexpr unsigned long ENTRY_MIN_INTERVAL_MS = 1500UL;
-constexpr unsigned long ENTRY_WINDOW_MS = 10000UL;
+#define PRESENCE_HOLD_MS   5000UL  // Sau khi xác nhận có người, cho phép khoảng nghỉ giữa hai xung.
+//  Xác nhận có người ở cạnh lên thứ hai nếu hai cạnh đã lọc cách nhau 2 - 5 giây.
+constexpr unsigned long ENTRY_MIN_INTERVAL_MS = 2000UL;
+constexpr unsigned long ENTRY_WINDOW_MS = 5000UL;
 
 // ---- Nguong nhiet do cho quat tu dong ----
 #define FAN_TEMP_ON_C   28.0f   // >= nhiet do nay thi cho phep bat quat
 #define FAN_TEMP_OFF_C  26.0f   // <= nhiet do nay thi tat quat (tranh bat/tat lien tuc)
 
 // ===================== PIR FILTER =====================
-#define PIR_WARMUP_MS          60000UL
+#define PIR_WARMUP_MS          30000UL
+#define PIR_STARTUP_LOW_MS      3000UL  // Thời gian LOW liên tục sau khi hết thời gian khởi động.
 #define PIR_SAMPLE_INTERVAL_MS 20UL
-#define PIR_HIGH_CONFIRM_MS    450UL
-#define PIR_LOW_CONFIRM_MS     400UL
 
 // Đổi thành true rồi nạp qua USB để chỉ đọc GPIO14 và in Serial.
 constexpr bool PIR_RAW_ONLY = false;
@@ -94,30 +100,57 @@ typedef struct __attribute__((packed)) {
   char command[20];
 } ControlData;
 
+// Giữ nguyên SensorData đến khi bridge gửi FAN_GET để nhận cả mức và chế độ quạt.
+struct __attribute__((packed)) FanTelemetry {
+  SensorData sensors;
+  uint8_t fan_level;
+  uint8_t fan_mode;  // 0 AUTO, 1 nút nhấn, 2 gateway, 3 báo động.
+};
+static_assert(sizeof(SensorData) == 16 && sizeof(ControlData) == 20 && sizeof(FanTelemetry) == 18,
+              "Unexpected ESP-NOW packet layout");
 SensorData sensorData;
+constexpr unsigned int COMMAND_QUEUE_DEPTH = 12;
+QueueHandle_t commandQueue = nullptr;
 
-const float LUX_THRESHOLD = 50.0f;
+struct __attribute__((packed)) FanButtonTelemetry {
+  FanTelemetry fan;
+  uint8_t fan_button;
+};
+static_assert(sizeof(FanButtonTelemetry) == 19, "Unexpected button packet size");
 
-bool manualMode = false;
-bool fanState = false;
+size_t fanReportBytes = sizeof(SensorData);
+uint8_t pendingFanButton = 0;
+bool fanReplyDue = false;
+
+constexpr unsigned long LUX_SAMPLE_MS = 300UL;
+constexpr float LUX_ON_THRESHOLD = 50.0f;
+constexpr float LUX_OFF_THRESHOLD = 100.0f;
+constexpr uint8_t BRIGHT_SAMPLES_TO_TURN_OFF = 2;
+uint8_t brightSamples = 0;
+
+// Lệnh cho quạt và đèn chỉ đổi chế độ của thiết bị tương ứng.
+enum class DeviceMode : uint8_t { Auto = 0, Button = 1, Gateway = 2 };
+DeviceMode fanMode = DeviceMode::Auto;
+DeviceMode ledMode = DeviceMode::Auto;
+uint8_t fanLevel = 0;
+uint8_t fanDuty = 0;
+bool fanStarting = false;
+unsigned long fanStartMs = 0;
 bool ledState = false;
 uint8_t alarmLevel = 0;
 unsigned long lastMotionMs = 0;
 unsigned long lastSensorMs = 0;
-
-// ---- Ghi de tu nut nhan (manual) ----
-bool fanOverride = false;    // true: nut nhan dang quyet dinh quat
-bool ledOverride = false;    // true: nut nhan dang quyet dinh den
 unsigned long lastBtnMs = 0; // lan nhan nut gan nhat (cho bo dem 30 phut)
 
 // ---- Snapshot trang thai truoc bao dong de khoi phuc ----
 struct PreAlarmSnapshot
 {
   bool valid;
-  bool manualMode, fanOverride, ledOverride;
-  bool fan, led;
+  DeviceMode fanMode, ledMode;
+  uint8_t fanLevel;
+  bool led;
 };
-PreAlarmSnapshot preAlarm = {false, false, false, false, false, false};
+PreAlarmSnapshot preAlarm{};
 
 // ---- Trang thai nhiet do (co tre) ----
 bool tempHot = false;
@@ -158,6 +191,9 @@ struct Button {
 
 Button btnLed = {BTN_LED_SIG2, HIGH, HIGH, 0, 0, false};
 Button btnFan = {BTN_FAN_SIG2, HIGH, HIGH, 0, 0, false};
+uint8_t fanTapCount = 0;
+unsigned long lastFanReleaseMs = 0;
+bool ignoreFanUntilRelease = false;
 
 BtnEvent readButton(Button &b)
 {
@@ -188,23 +224,51 @@ BtnEvent readButton(Button &b)
 }
 
 // ===================== ACTUATORS =====================
-void fanOn()
+void updateFanPwm()
 {
-  if (fanState) return;
-  ledcWrite(PWM_A, 0);
-  for (int speed = 0; speed <= FAN_SPEED; speed += 10)
-  {
-    ledcWrite(PWM_B, speed);
-    delay(15);
+  uint8_t duty = FAN_PWM[fanLevel];
+  if (fanStarting) {
+    const unsigned long elapsed = millis() - fanStartMs;
+    if (elapsed < FAN_RAMP_MS) {
+      duty = static_cast<uint8_t>(FAN_PWM[FAN_HIGH] * elapsed / FAN_RAMP_MS);
+    } else if (elapsed < FAN_RAMP_MS + FAN_START_HOLD_MS) {
+      duty = FAN_PWM[FAN_HIGH];
+    } else {
+      fanStarting = false;
+    }
   }
-  fanState = true;
+  if (duty != fanDuty) {
+    ledcWrite(PWM_B, duty);
+    fanDuty = duty;
+  }
 }
 
-void fanOff()
+void setFanLevel(uint8_t level)
 {
-  ledcWrite(PWM_A, 0);
-  ledcWrite(PWM_B, 0);
-  fanState = false;
+  if (level > FAN_HIGH || level == fanLevel) return;
+  if (level == 0) {
+    fanStarting = false;
+  } else if (fanLevel == 0) {
+    // Khởi động êm đến mức quạt đã chạy ổn, rồi hạ xuống mức đã chọn.
+    fanStartMs = millis();
+    fanStarting = true;
+  }
+  fanLevel = level;
+  updateFanPwm();
+}
+
+void fanOn() { setFanLevel(FAN_HIGH); }
+void fanOff() { setFanLevel(0); }
+
+void cancelFanGesture()
+{
+  fanTapCount = 0;
+  if (btnFan.stableState == LOW || digitalRead(btnFan.pin) == LOW) ignoreFanUntilRelease = true;
+}
+
+uint8_t fanModeForReport()
+{
+  return alarmLevel > 0 ? 3 : static_cast<uint8_t>(fanMode);
 }
 
 void ledOn()
@@ -221,6 +285,8 @@ void ledOff()
 
 void setAlarm(uint8_t level)
 {
+  cancelFanGesture();
+  if (level != alarmLevel) fanReplyDue = true;
   alarmLevel = level;
   if (level == 0) {
     ledcWrite(PWM_BUZZER, 0);
@@ -240,7 +306,7 @@ void setAlarm(uint8_t level)
 void snapshotBeforeAlarm()
 {
   if (alarmLevel != 0 || preAlarm.valid) return;
-  preAlarm = {true, manualMode, fanOverride, ledOverride, fanState, ledState};
+  preAlarm = {true, fanMode, ledMode, fanLevel, ledState};
 }
 
 void restoreAfterAlarm()
@@ -249,18 +315,17 @@ void restoreAfterAlarm()
   preAlarm.valid = false;
 
   alarmLevel = 0;
+  fanReplyDue = true;
   ledcWrite(PWM_BUZZER, 0);
 
-  manualMode  = snap.manualMode;
-  fanOverride = snap.fanOverride;
-  ledOverride = snap.ledOverride;
-
-  if (manualMode || fanOverride) {
-    if (snap.fan) fanOn(); else fanOff();
+  fanMode = snap.fanMode;
+  ledMode = snap.ledMode;
+  cancelFanGesture();
+  if (fanMode != DeviceMode::Auto) {
+    setFanLevel(snap.fanLevel);
   }
-  if (manualMode || ledOverride) {
-    if (snap.led) ledOn(); else ledOff();
-  }
+  // Trong dải 50–100 lux, AUTO cần trạng thái đèn trước khi báo động.
+  if (snap.led) ledOn(); else ledOff();
 
   lastBtnMs = millis();
   lastSensorMs = millis() - SENSOR_INTERVAL_MS;
@@ -270,9 +335,12 @@ void restoreAfterAlarm()
 
 void updateButtonLamps()
 {
-  bool lampOn = !ledState;
-  digitalWrite(BTN_LED_SIG1, lampOn ? HIGH : LOW);
-  digitalWrite(BTN_FAN_SIG1, lampOn ? HIGH : LOW);
+  // Sau ba nhịp xác nhận AUTO, giữ tiếp nút vàng để xem BH1750 đã đủ sáng chưa.
+  const bool showBrightness = alarmLevel == 0 && btnLed.longFired && btnLed.stableState == LOW;
+  const bool locatorOn = !ledState;
+  const bool yellowOn = showBrightness ? brightSamples >= BRIGHT_SAMPLES_TO_TURN_OFF : locatorOn;
+  digitalWrite(BTN_LED_SIG1, yellowOn ? HIGH : LOW);
+  digitalWrite(BTN_FAN_SIG1, locatorOn ? HIGH : LOW);
 }
 
 void blinkLamp(uint8_t pin)
@@ -296,79 +364,111 @@ void handleButtons()
   }
 
   if (eled == BTN_SHORT) {
-    ledOverride = true;
+    ledMode = DeviceMode::Button;
     lastBtnMs = millis();
     if (ledState) ledOff(); else ledOn();
     Serial.printf("Button LED -> %s (MANUAL)\n", ledState ? "ON" : "OFF");
   } else if (eled == BTN_LONG) {
-    ledOverride = false;
-    manualMode = false;
+    ledMode = DeviceMode::Auto;
     blinkLamp(BTN_LED_SIG1);
     lastSensorMs = millis() - SENSOR_INTERVAL_MS;
     Serial.println("Button LED -> AUTO");
   }
 
-  if (efan == BTN_SHORT) {
-    fanOverride = true;
-    lastBtnMs = millis();
-    if (fanState) fanOff(); else fanOn();
-    Serial.printf("Button FAN -> %s (MANUAL)\n", fanState ? "ON" : "OFF");
-  } else if (efan == BTN_LONG) {
-    fanOverride = false;
-    manualMode = false;
+  if (ignoreFanUntilRelease) {
+    if (btnFan.stableState == HIGH && btnFan.lastReading == HIGH) ignoreFanUntilRelease = false;
+    return;
+  }
+
+  if (efan == BTN_LONG) {
+    fanTapCount = 0;
+    fanMode = DeviceMode::Auto;
     blinkLamp(BTN_FAN_SIG1);
-    lastSensorMs = millis() - SENSOR_INTERVAL_MS;
+    fanReplyDue = true;
     Serial.println("Button FAN -> AUTO");
+    pendingFanButton = 255;
+  } else if (efan == BTN_SHORT) {
+    if (fanTapCount < 5) ++fanTapCount;
+    lastFanReleaseMs = millis();
+  }
+  // Chỉ áp dụng một lần sau nhịp cuối. Giữ nút tiếp theo sẽ hủy chuỗi và về AUTO.
+  if (fanTapCount && btnFan.stableState == HIGH && btnFan.lastReading == HIGH &&
+      millis() - lastFanReleaseMs >= FAN_TAP_GAP_MS) {
+    const uint8_t taps = fanTapCount;
+    fanTapCount = 0;
+    if (taps <= 3) {
+      const bool turnOff =
+          taps == 1 && fanMode != DeviceMode::Auto && fanLevel > 0;
+
+      fanMode = DeviceMode::Button;
+      lastBtnMs = millis();
+      setFanLevel(turnOff ? 0 : taps);
+      pendingFanButton = taps;
+      fanReplyDue = true;
+      Serial.printf("Button FAN -> level %u\n", static_cast<unsigned>(fanLevel));
+    }
   }
 }
 
 // ===================== COMMAND HANDLING =====================
 void applyCommand(const char *command)
 {
-  if (alarmLevel > 0 &&
-      (strcmp(command, "FAN_ON") == 0  || strcmp(command, "ON") == 0  ||
-       strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0 ||
-       strcmp(command, "LED_ON") == 0  || strcmp(command, "LED_OFF") == 0)) {
+  const bool levelCommand = strncmp(command, "FAN_", 4) == 0 &&
+      command[4] >= '0' && command[4] <= '3' && command[5] == '\0';
+  const bool fanAuto = strcmp(command, "FAN_AUTO") == 0;
+  const bool fanGet = strcmp(command, "FAN_GET") == 0;
+  const bool buttonGet = strcmp(command, "FAN_BTN_GET") == 0;
+  if (fanGet || buttonGet) {
+    fanReportBytes = buttonGet ? sizeof(FanButtonTelemetry) : sizeof(FanTelemetry);
+    fanReplyDue = true;
+    return;
+  }
+  if (levelCommand || fanAuto) fanReplyDue = true;
+  const bool on = strcmp(command, "FAN_ON") == 0 || strcmp(command, "ON") == 0;
+  const bool off = strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0;
+  if (alarmLevel > 0 && (on || off || levelCommand || fanAuto ||
+      strcmp(command, "LED_ON") == 0 || strcmp(command, "LED_OFF") == 0)) {
     Serial.println("Alarm active: ignore device command");
     return;
   }
 
-  if (strcmp(command, "FAN_ON") == 0 || strcmp(command, "ON") == 0) {
-    manualMode = true;
-    fanOn();
-  } else if (strcmp(command, "FAN_OFF") == 0 || strcmp(command, "OFF") == 0) {
-    manualMode = true;
-    fanOff();
+  if (levelCommand || on || off) {
+    cancelFanGesture();
+    fanMode = DeviceMode::Gateway;
+    uint8_t level = on ? FAN_HIGH : 0;
+    if (levelCommand) level = static_cast<uint8_t>(command[4] - '0');
+    setFanLevel(level);
+    fanReplyDue = true;
+  } else if (fanAuto) {
+    cancelFanGesture();
+    fanMode = DeviceMode::Auto;
   } else if (strcmp(command, "LED_ON") == 0) {
-    manualMode = true;
+    ledMode = DeviceMode::Gateway;
     ledOn();
   } else if (strcmp(command, "LED_OFF") == 0) {
-    manualMode = true;
+    ledMode = DeviceMode::Gateway;
     ledOff();
   } else if (strcmp(command, "ALARM_MED") == 0) {
     snapshotBeforeAlarm();
-    manualMode = true;
     setAlarm(1);
   } else if (strcmp(command, "ALARM_MAX") == 0 || strcmp(command, "ALERT_ON") == 0) {
     snapshotBeforeAlarm();
-    manualMode = true;
     setAlarm(2);
   } else if (strcmp(command, "ALARM_OFF") == 0 || strcmp(command, "ALERT_OFF") == 0) {
     if (preAlarm.valid) {
       restoreAfterAlarm();
     } else if (alarmLevel > 0) {
-      manualMode = false;
-      fanOverride = false;
-      ledOverride = false;
+      fanMode = DeviceMode::Auto;
+      ledMode = DeviceMode::Auto;
       setAlarm(0);
     } else {
       Serial.println("ALARM_OFF lap lai: bo qua (da het bao dong)");
     }
   } else if (strcmp(command, "AUTO") == 0) {
     preAlarm.valid = false;
-    manualMode = false;
-    fanOverride = false;
-    ledOverride = false;
+    fanMode = DeviceMode::Auto;
+    fanReplyDue = true;
+    ledMode = DeviceMode::Auto;
     setAlarm(0);
   } else if (strcmp(command, "OTA") == 0) {
     otaRequested = true;
@@ -377,7 +477,7 @@ void applyCommand(const char *command)
 
 void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
 {
-  if (len != sizeof(ControlData)) {
+  if (len != sizeof(ControlData) || commandQueue == nullptr) {
     return;
   }
 
@@ -385,9 +485,23 @@ void OnDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len)
   memcpy(&cmd, incomingData, sizeof(cmd));
   cmd.command[sizeof(cmd.command) - 1] = '\0';
 
-  Serial.print("Command: ");
-  Serial.println(cmd.command);
-  applyCommand(cmd.command);
+  // Callback Wi-Fi chỉ xếp lệnh. Vòng loop xử lý PWM, nút và báo động theo thứ tự.
+  if (xQueueSend(commandQueue, &cmd, 0) != pdTRUE) {
+    Serial.println("ESP-NOW command queue full");
+  }
+}
+
+void handleCommands()
+{
+  if (commandQueue == nullptr) return;
+  ControlData cmd;
+  for (unsigned int i = 0; i < COMMAND_QUEUE_DEPTH; ++i) {
+    if (xQueueReceive(commandQueue, &cmd, 0) != pdTRUE) break;
+    Serial.print("Command: ");
+    Serial.println(cmd.command);
+    applyCommand(cmd.command);
+    if (otaRequested) break;
+  }
 }
 
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
@@ -431,12 +545,12 @@ void updatePirFilter()
     if (now - bootMs < PIR_WARMUP_MS) return;
     pirPhase = PirPhase::WaitLow;
     pirStableSinceMs = now;
-    Serial.println("[PIR] WAIT_LOW");
+    Serial.printf("[PIR] WAIT_LOW (%lu ms)\n", PIR_STARTUP_LOW_MS);
   }
 
   const unsigned long stableMs = now - pirStableSinceMs;
   if (pirPhase == PirPhase::WaitLow) {
-    if (raw == LOW && stableMs >= PIR_LOW_CONFIRM_MS) {
+    if (raw == LOW && stableMs >= PIR_STARTUP_LOW_MS) {
       pirPhase = PirPhase::Ready;
       Serial.println("[PIR] READY");
     }
@@ -444,8 +558,7 @@ void updatePirFilter()
   }
 
   const bool high = (raw == HIGH);
-  const unsigned long confirmMs = high ? PIR_HIGH_CONFIRM_MS : PIR_LOW_CONFIRM_MS;
-  if (high == pirFilteredState || stableMs < confirmMs) return;
+  if (high == pirFilteredState) return;
 
   pirFilteredState = high;
   Serial.printf("[PIR] t=%lu ms FLT=%d\n", now, high ? 1 : 0);
@@ -457,15 +570,16 @@ bool updateRoomPresence(bool motion, unsigned long now)
   static RoomState state = RoomState::Empty;
   static unsigned long firstPulseMs = 0;
   static bool previousMotion = false;
+  const unsigned long sinceLastEdgeMs = now - lastMotionMs;
 
   // Xét hết hạn trước khi xử lý cạnh mới, kể cả khi vòng lặp vừa bị trễ.
   if (state == RoomState::WaitingForSecondPulse && now - firstPulseMs > ENTRY_WINDOW_MS) {
     state = RoomState::Empty;
     Serial.println("[ROOM] EMPTY (entry window expired)");
   } else if (state == RoomState::Occupied && !previousMotion &&
-             now - lastMotionMs >= PRESENCE_HOLD_MS) {
+             sinceLastEdgeMs >= PRESENCE_HOLD_MS) {
     state = RoomState::Empty;
-    Serial.println("[ROOM] EMPTY");
+    Serial.printf("[ROOM] EMPTY (FLT=0 for %lu ms)\n", sinceLastEdgeMs);
   }
 
   if (motion != previousMotion) {
@@ -479,6 +593,8 @@ bool updateRoomPresence(bool motion, unsigned long now)
                now - firstPulseMs >= ENTRY_MIN_INTERVAL_MS) {
       state = RoomState::Occupied;
       Serial.println("[ROOM] OCCUPIED");
+    } else if (motion && state == RoomState::Occupied) {
+      Serial.printf("[ROOM] LOW_GAP_MS=%lu\n", sinceLastEdgeMs);
     }
   }
   return state == RoomState::Occupied;
@@ -491,11 +607,20 @@ void sendData(float t, float h, float lux, bool motion)
   sensorData.humid = h;
   sensorData.light = lux;
   sensorData.motion = motion;
-  sensorData.fan = fanState;
+  sensorData.fan = fanLevel != 0;
   sensorData.led = ledState;
   sensorData.alarm_level = alarmLevel;
 
-  esp_now_send(gatewayMAC, (uint8_t *)&sensorData, sizeof(sensorData));
+  const FanButtonTelemetry packet{
+    {sensorData, fanLevel, fanModeForReport()}, pendingFanButton
+  };
+
+  if (esp_now_send(gatewayMAC, reinterpret_cast<const uint8_t *>(&packet),
+                  fanReportBytes) == ESP_OK) {
+    pendingFanButton = 0;
+  } else {
+    esp_now_send(gatewayMAC, reinterpret_cast<const uint8_t *>(&sensorData), sizeof(sensorData));
+  }
 }
 
 void initESPNow()
@@ -510,7 +635,9 @@ void initESPNow()
     while (true);
   }
 
-  esp_now_register_recv_cb(OnDataRecv);
+  commandQueue = xQueueCreate(COMMAND_QUEUE_DEPTH, sizeof(ControlData));
+  if (commandQueue != nullptr) esp_now_register_recv_cb(OnDataRecv);
+  else Serial.println("ESP-NOW command queue unavailable");
   esp_now_register_send_cb(OnDataSent);
 
   esp_now_peer_info_t peerInfo = {};
@@ -604,7 +731,8 @@ void setup()
   ledcAttachPin(INB, PWM_B);
   ledcAttachPin(BUZZER, PWM_BUZZER);
 
-  fanOff();
+  ledcWrite(PWM_A, 0);
+  ledcWrite(PWM_B, 0);
   ledOff();
   setAlarm(0);
   updateButtonLamps();
@@ -626,6 +754,7 @@ void loop()
   }
 
   // --- Che do OTA ---
+  if (!otaMode) handleCommands();
   if (otaRequested && !otaMode) {
     enterOtaMode();
   }
@@ -640,11 +769,13 @@ void loop()
 
   // --- Nut nhan & loc PIR: quet lien tuc ---
   handleButtons();
+  updateFanPwm();
   updateButtonLamps();
   updatePirFilter();
 
   unsigned long now = millis();
-  static float lastT = NAN, lastH = NAN, lastLux = 0.0f;
+  static float lastT = NAN, lastH = NAN, lastLux = NAN;
+  static unsigned long lastLuxMs = 0;
   static bool lastPresence = false;
 
   // 1. Xác nhận có người trước khi điều khiển tự động hoặc báo lên gateway.
@@ -653,17 +784,17 @@ void loop()
   bool presenceChanged = (presence != lastPresence);
   lastPresence = presence;
 
-  bool sensorDue = (now - lastSensorMs >= SENSOR_INTERVAL_MS);
-  if (!sensorDue && !presenceChanged) {
+  const bool sensorDue = (now - lastSensorMs >= SENSOR_INTERVAL_MS);
+  const bool luxDue = (now - lastLuxMs >= LUX_SAMPLE_MS);
+  if (!sensorDue && !presenceChanged && !luxDue && !fanReplyDue) {
     return;
   }
 
-  // 2. Chi doc DHT22 theo chu ky 2s
+  // 2. DHT22 và BH1750 có chu kỳ đọc riêng.
   if (sensorDue) {
     lastSensorMs = now;
     lastT = dht.getTemperature();
     lastH = dht.getHumidity();
-    lastLux = lightMeter.readLightLevel();
 
     if (!isnan(lastT)) {
       if (lastT >= FAN_TEMP_ON_C) tempHot = true;
@@ -672,38 +803,50 @@ void loop()
 
     unsigned long lastActivity = (lastMotionMs > lastBtnMs) ? lastMotionMs : lastBtnMs;
     if (OVERRIDE_RELEASE_MS > 0 && !presence &&
-        (now - lastActivity >= OVERRIDE_RELEASE_MS)) {
-      if (fanOverride || ledOverride) {
-        Serial.println("No presence: release button override");
-      }
-      fanOverride = false;
-      ledOverride = false;
+        now - lastActivity >= OVERRIDE_RELEASE_MS &&
+        (fanMode == DeviceMode::Button || ledMode == DeviceMode::Button)) {
+      Serial.println("No presence: release button override");
+      if (fanMode == DeviceMode::Button) fanMode = DeviceMode::Auto;
+      if (ledMode == DeviceMode::Button) ledMode = DeviceMode::Auto;
     }
-  } else if (presence) {
+  }
+  if (luxDue) {
+    lastLuxMs = now;
     lastLux = lightMeter.readLightLevel();
+    if (std::isfinite(lastLux) && lastLux >= LUX_OFF_THRESHOLD) {
+      if (brightSamples < BRIGHT_SAMPLES_TO_TURN_OFF) ++brightSamples;
+    } else {
+      brightSamples = 0;
+    }
   }
 
   // 3. Dieu khien thiet bi
-  if (!manualMode) {
-    if (!fanOverride) {
+  const bool ledBeforeAuto = ledState;
+  if (alarmLevel == 0) {
+    if (fanMode == DeviceMode::Auto && (sensorDue || presenceChanged || fanReplyDue)) {
       if (presence && tempHot) fanOn();
       else fanOff();
     }
-    if (!ledOverride) {
-      if (!presence || lastLux >= LUX_THRESHOLD) {
+    if (ledMode == DeviceMode::Auto) {
+      if (ledState && (!presence || brightSamples >= BRIGHT_SAMPLES_TO_TURN_OFF)) {
         ledOff();
-      } else if (!ledState && lastLux >= 0.0f && lastLux < LUX_THRESHOLD) {
+      } else if (presence && !ledState && lastLux >= 0.0f && lastLux < LUX_ON_THRESHOLD) {
         ledOn();
       }
     }
   }
 
-  // 4. Gửi theo chu kỳ hoặc ngay khi PRES đổi, kể cả lúc DHT22 chưa có số đo.
-  Serial.printf("T=%.1f H=%.1f LUX=%.2f PIR=%s RAW=%d FLT=%d PRES=%d HOT=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d\n",
+  // Phản hồi cả khi chuyển giữa hai mức đang quay hoặc được hỏi lại cùng mức.
+  if (!sensorDue && !presenceChanged && ledBeforeAuto == ledState && !fanReplyDue) return;
+  fanReplyDue = false;
+  const bool gwFan = fanMode == DeviceMode::Gateway;
+  const bool gwLed = ledMode == DeviceMode::Gateway;
+  Serial.printf("T=%.1f H=%.1f LUX=%.2f PIR=%s RAW=%d FLT=%d PRES=%d HOT=%d FAN=%d LED=%d | fanMan=%d ledMan=%d gwMan=%d gwLed=%d alarm=%d bright=%d/%d\n",
                 lastT, lastH, lastLux, pirPhaseName(),
                 pirRaw, motion ? 1 : 0, presence ? 1 : 0,
-                tempHot ? 1 : 0, fanState ? 1 : 0, ledState ? 1 : 0,
-                fanOverride ? 1 : 0, ledOverride ? 1 : 0, manualMode ? 1 : 0);
+                tempHot ? 1 : 0, fanLevel != 0, ledState ? 1 : 0,
+                fanMode == DeviceMode::Button, ledMode == DeviceMode::Button, gwFan || gwLed || alarmLevel > 0,
+                gwLed, alarmLevel, brightSamples, BRIGHT_SAMPLES_TO_TURN_OFF);
 
   neopixelWrite(48, 0, 0, 0);
   updateButtonLamps();
